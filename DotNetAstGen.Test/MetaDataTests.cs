@@ -24,4 +24,14 @@ public class MetaDataTests
         Assert.True(Program.TryAstForString("test.cs", code, out var jsonString));
         Assert.DoesNotContain(@"""Code"": ""/* Comment */System.Console.WriteLine(0);""", jsonString);
     }
+
+    [Fact]
+    public void CancelsParsingWhenTheFileTimeoutExpires()
+    {
+        using var cancellationSource = new CancellationTokenSource();
+        cancellationSource.Cancel();
+
+        Assert.Throws<OperationCanceledException>(() =>
+            Program.TryAstForString("test.cs", "class Example { }", cancellationSource.Token, out _));
+    }
 }
