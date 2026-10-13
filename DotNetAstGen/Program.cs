@@ -56,11 +56,18 @@ namespace DotNetAstGen
                     _logger = LoggerFactory.CreateLogger<Program>();
                     _logger.LogDebug("Show verbose output.");
 
+                    if (options.SourceFileTimeoutSeconds < 0)
+                    {
+                        _logger.LogError("source-file-timeout-seconds must be zero or greater.");
+                        Environment.Exit(1);
+                    }
+
                     // Handle .cs
                     _ParseSourceCode(
                         new DirectoryInfo(options.InputFilePath),
                         new DirectoryInfo(options.OutputDirectory),
-                        options.ExclusionRegex);
+                        options.ExclusionRegex,
+                        TimeSpan.FromSeconds(options.SourceFileTimeoutSeconds));
 
                     // Handle DLLs
                     _ParseByteCode(options.InputFilePath,
@@ -70,7 +77,7 @@ namespace DotNetAstGen
         }
 
         private static void _ParseSourceCode(DirectoryInfo inputDirPath, DirectoryInfo rootOutputPath,
-            string? exclusionRegex)
+            string? exclusionRegex, TimeSpan sourceFileTimeout)
         {
             if (!rootOutputPath.Exists)
             {
@@ -86,13 +93,18 @@ namespace DotNetAstGen
                 rootDirectory
                     .EnumerateFiles("*.cs", SearchOption.AllDirectories)
                     .AsParallel()
-                    .ForAll(inputFile => _AstForFile(rootDirectory, rootOutputPath, inputFile, exclusionRegex));
+                    .ForAll(inputFile => _AstForFile(
+                        rootDirectory,
+                        rootOutputPath,
+                        inputFile,
+                        exclusionRegex,
+                        sourceFileTimeout));
             }
             else if (File.Exists(inputPath))
             {
                 var file = new FileInfo(inputPath);
                 Debug.Assert(file.Directory != null, "Given file has a null parent directory!");
-                _AstForFile(file.Directory, rootOutputPath, file, exclusionRegex);
+                _AstForFile(file.Directory, rootOutputPath, file, exclusionRegex, sourceFileTimeout);
             }
             else
             {
@@ -112,8 +124,24 @@ namespace DotNetAstGen
         /// <returns>true if no errors were emitted during parsing.</returns>
         public static bool TryAstForString(string fullPath, string programText, out string jsonString)
         {
-            var tree = CSharpSyntaxTree.ParseText(programText);
-            var diagnostics = new List<Diagnostic>(tree.GetDiagnostics());
+            return TryAstForString(fullPath, programText, CancellationToken.None, out jsonString);
+        }
+
+        /// <summary>
+        /// Attempts to build and JSON-serialize a <see cref="AstGenWrapper"/>, cancelling
+        /// Roslyn parsing and diagnostics if the supplied token is cancelled.
+        /// </summary>
+        public static bool TryAstForString(
+            string fullPath,
+            string programText,
+            CancellationToken cancellationToken,
+            out string jsonString)
+        {
+            jsonString = string.Empty;
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var tree = CSharpSyntaxTree.ParseText(programText, cancellationToken: cancellationToken);
+            var diagnostics = new List<Diagnostic>(tree.GetDiagnostics(cancellationToken));
             var errorWhileParsing = false;
             foreach (Diagnostic diagnostic in diagnostics)
             {
@@ -129,6 +157,7 @@ namespace DotNetAstGen
                 }
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             var astGenResult = new AstGenWrapper(fullPath, tree);
             jsonString = JsonConvert.SerializeObject(astGenResult, Formatting.Indented,
                 new JsonSerializerSettings
@@ -138,6 +167,7 @@ namespace DotNetAstGen
                         new SyntaxNodePropertiesResolver() // Comment this to see the unfiltered parser output
                 });
 
+            cancellationToken.ThrowIfCancellationRequested();
             return !errorWhileParsing;
         }
 
@@ -145,7 +175,8 @@ namespace DotNetAstGen
             FileSystemInfo rootInputPath,
             FileSystemInfo rootOutputPath,
             FileInfo filePath,
-            string? exclusionRegex)
+            string? exclusionRegex,
+            TimeSpan sourceFileTimeout)
         {
             var fullPath = filePath.FullName;
             if (exclusionRegex != null && Regex.IsMatch(fullPath, exclusionRegex))
@@ -158,9 +189,15 @@ namespace DotNetAstGen
 
             try
             {
+                using var timeoutCancellationSource = sourceFileTimeout > TimeSpan.Zero
+                    ? new CancellationTokenSource(sourceFileTimeout)
+                    : null;
+                var cancellationToken = timeoutCancellationSource?.Token ?? CancellationToken.None;
+
                 using var streamReader = new StreamReader(fullPath, Encoding.UTF8);
                 var programText = streamReader.ReadToEnd();
-                var errorWhileParsing = !TryAstForString(fullPath, programText, out var jsonString);
+                cancellationToken.ThrowIfCancellationRequested();
+                var errorWhileParsing = !TryAstForString(fullPath, programText, cancellationToken, out var jsonString);
                 if (errorWhileParsing)
                 {
                     _logger?.LogError("Error(s) encountered while parsing: {filePath}", fullPath);
@@ -181,6 +218,13 @@ namespace DotNetAstGen
 
                     File.WriteAllText(outputName, jsonString);
                 }
+            }
+            catch (OperationCanceledException) when (sourceFileTimeout > TimeSpan.Zero)
+            {
+                _logger?.LogWarning(
+                    "Timed out after {timeoutSeconds} seconds while parsing; skipping file: {filePath}",
+                    sourceFileTimeout.TotalSeconds,
+                    fullPath);
             }
             catch (Exception e)
             {
@@ -335,5 +379,9 @@ namespace DotNetAstGen
 
         [Option('e', "exclude", Required = false, HelpText = "Exclusion regex for while files to filter out.")]
         public string? ExclusionRegex { get; set; } = null;
+
+        [Option("source-file-timeout-seconds", Required = false,
+            HelpText = "Maximum time to parse one C# source file before it is skipped. Use 0 to disable the timeout.")]
+        public int SourceFileTimeoutSeconds { get; set; } = 120;
     }
 }
